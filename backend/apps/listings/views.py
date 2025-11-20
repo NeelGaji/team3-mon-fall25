@@ -1,27 +1,41 @@
+import logging
+
+from django.db import transaction
+from django.db.models import Q, F
+from django.core.cache import cache
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework import filters, mixins, pagination, status, viewsets
 from rest_framework.decorators import action
-from django.shortcuts import render
-from rest_framework import viewsets, mixins, status
+from rest_framework.exceptions import ValidationError
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import (
-    IsAuthenticatedOrReadOnly,
+    SAFE_METHODS,
     BasePermission,
     IsAuthenticated,
-    SAFE_METHODS,
+    IsAuthenticatedOrReadOnly,
+    AllowAny,
 )
-from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
-from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
+from django.core.exceptions import RequestDataTooBig
+
+from utils.s3_service import s3_service
+
+from apps.chat.models import Conversation, ConversationParticipant
+from .constants import (
+    DEFAULT_CATEGORIES,
+    DEFAULT_DORM_LOCATIONS_FLAT,
+    WASHINGTON_SQUARE_DORMS,
+    DOWNTOWN_DORMS,
+    OTHER,
+)
+from .filters import ListingFilter
 from .models import Listing
 from .serializers import (
-    ListingCreateSerializer,
-    ListingUpdateSerializer,
     CompactListingSerializer,
+    ListingCreateSerializer,
     ListingDetailSerializer,
+    ListingUpdateSerializer,
 )
-from utils.s3_service import s3_service
-import logging
-from rest_framework import filters
-from django_filters.rest_framework import DjangoFilterBackend
-from .filters import ListingFilter
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +55,10 @@ class IsOwnerOrReadOnly(BasePermission):
         return obj.user == request.user
 
 
-# Create your views here.
+class ListingPagination(pagination.PageNumberPagination):
+    page_size = 12
+    page_size_query_param = "page_size"
+    max_page_size = 60
 
 
 class ListingViewSet(
@@ -58,35 +75,49 @@ class ListingViewSet(
     Supports multipart/form-data for image uploads.
     """
 
-    queryset = Listing.objects.filter(status="active")
+    queryset = Listing.objects.all()
+
     permission_classes = [IsAuthenticatedOrReadOnly, IsOwnerOrReadOnly]
     parser_classes = [MultiPartParser, FormParser, JSONParser]
+    pagination_class = ListingPagination
 
-    filter_backends = [DjangoFilterBackend, filters.OrderingFilter, filters.SearchFilter]
+    filter_backends = [
+        DjangoFilterBackend,
+        filters.OrderingFilter,
+        filters.SearchFilter,
+    ]
     filterset_class = ListingFilter
-    ordering_fields = ['created_at', 'price', 'title']
-    ordering = ['-created_at']
-    search_fields = ['title', 'description', 'location']
+    ordering_fields = ["created_at", "price", "title"]
+    ordering = ["-created_at"]
+
+    # TODO: add location to search_fields when we implement geographical location
+    # via Google Maps API
+    # search_fields = ["title", "description", "location", "dorm_location", "category"]
+    search_fields = ["title", "description", "dorm_location", "category"]
 
     def get_queryset(self):
         queryset = super().get_queryset()
 
-        
-        allowed_fields = {'created_at', 'price', 'title'}
-        ordering_param = self.request.query_params.get('ordering')
+        # Only public list/search should be restricted to active listings
+        if self.action in ["list", "search"]:
+            queryset = queryset.filter(status="active")
+
+        allowed_fields = {"created_at", "price", "title"}
+        ordering_param = self.request.query_params.get("ordering")
 
         if ordering_param:
-            #any mistake if made at the end of the URL will be stripped
-            ordering_param = ordering_param.strip() 
-            raw = ordering_param.lstrip('-')
+            ordering_param = ordering_param.strip()
+            raw = ordering_param.lstrip("-")
             if raw not in allowed_fields:
                 raise ValidationError({"ordering": ["Invalid ordering field."]})
             queryset = queryset.order_by(ordering_param)
         else:
-            queryset = queryset.order_by('-created_at')
+            queryset = queryset.order_by("-created_at")
+
+        # Performance optimizations to avoid N+1
+        queryset = queryset.select_related("user").prefetch_related("images")
 
         return queryset
-
 
     def get_serializer_class(self):
         if self.action == "create":
@@ -103,12 +134,105 @@ class ListingViewSet(
 
     def get_permissions(self):
         """
-        Set different permissions for different actions
+        Set different permissions for different actions:
+
+        - list / retrieve / search: public (no auth required)
+        - user_listings: must be authenticated
+        - contact_seller: must be authenticated (handled by @action decorator)
+        - everything else: default (create/update/delete protected)
         """
+        # Public read-only endpoints
+        if self.action in ["list", "retrieve", "search"]:
+            return [AllowAny()]
+
+        # User's own listings require auth
         if self.action == "user_listings":
-            # User listings endpoint requires authentication
             return [IsAuthenticated()]
-        return super().get_permissions()
+
+        # contact_seller uses IsAuthenticated from @action decorator
+        # Don't apply IsOwnerOrReadOnly for this action
+        if self.action == "contact_seller":
+            return [IsAuthenticated()]
+
+        # Default: respect view's base permissions
+        # (create/update/destroy + other actions)
+        return [IsAuthenticatedOrReadOnly(), IsOwnerOrReadOnly()]
+
+    def create(self, request, *args, **kwargs):
+        """Handle create with error handling for large uploads"""
+        try:
+            return super().create(request, *args, **kwargs)
+        except RequestDataTooBig:
+            user_id = (
+                request.user.user_id if request.user.is_authenticated else "anonymous"
+            )
+            logger.error(f"Request data too large for user {user_id}")
+            return Response(
+                {
+                    "detail": (
+                        "Uploaded file(s) are too large. "
+                        "Maximum size per image is 10MB."
+                    )
+                },
+                status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            )
+        except Exception as e:
+            # Check if it's a 413 error from nginx or Django
+            if "413" in str(e) or "Request Entity Too Large" in str(e):
+                user_id = (
+                    request.user.user_id
+                    if request.user.is_authenticated
+                    else "anonymous"
+                )
+                logger.error(f"413 error for user {user_id}: {str(e)}")
+                return Response(
+                    {
+                        "detail": (
+                            "Uploaded file(s) are too large. "
+                            "Maximum size per image is 10MB."
+                        )
+                    },
+                    status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                )
+            raise
+
+    def update(self, request, *args, **kwargs):
+        """Handle update with error handling for large uploads"""
+        try:
+            return super().update(request, *args, **kwargs)
+        except RequestDataTooBig:
+            user_id = (
+                request.user.user_id if request.user.is_authenticated else "anonymous"
+            )
+            logger.error(f"Request data too large for user {user_id}")
+            return Response(
+                {
+                    "detail": (
+                        "Uploaded file(s) are too large. "
+                        "Maximum size per image is 10MB."
+                    )
+                },
+                status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            )
+        except Exception as e:
+            # Check if it's a 413 error from nginx or Django
+            if "413" in str(e) or "Request Entity Too Large" in str(e):
+                user_id = (
+                    request.user.user_id
+                    if request.user.is_authenticated
+                    else "anonymous"
+                )
+                logger.error(f"413 error for user {user_id}: {str(e)}")
+                return Response(
+                    {
+                        "detail": (
+                            "Uploaded file(s) are too large. "
+                            "Maximum size per image is 10MB."
+                        )
+                    },
+                    status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                )
+            raise
 
     def perform_create(self, serializer):
         """Automatically set the user when creating a listing"""
@@ -127,6 +251,56 @@ class ListingViewSet(
         user_listings = Listing.objects.filter(user=request.user)
         serializer = self.get_serializer(user_listings, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="is_saved")
+    def is_saved(self, request, pk=None):
+        """
+        Check if listing is saved by current user
+        GET /api/v1/listings/:id/is_saved/
+        """
+        from .models import Watchlist
+
+        listing = self.get_object()
+        is_saved = Watchlist.objects.filter(user=request.user, listing=listing).exists()
+        return Response({"is_saved": is_saved}, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=["get"], url_path="search")
+    def search(self, request):
+        """
+        Search listings by keyword across title/description/location/category.
+
+        Usage:
+          GET /api/v1/listings/search/?q=desk
+          GET /api/v1/listings/search/?q=lamp&ordering=price&page=2&page_size=12
+
+        Contract for tests:
+          - If the query param key `q` is MISSING -> 400 with {"detail": "..."}.
+          - If `q` exists but is EMPTY (`?q=`) -> 200 with results (no text filter)
+        """
+        # 400 only if the *key* is missing; empty string is allowed
+        if "q" not in request.query_params:
+            return Response(
+                {"detail": "Missing 'q' query parameter. Use ?q=..."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        q = request.query_params.get("q", "")
+        base_qs = self.get_queryset()
+
+        if q != "":
+            qs = base_qs.filter(
+                Q(title__icontains=q)
+                | Q(description__icontains=q)
+                | Q(dorm_location__icontains=q)
+                | Q(category__icontains=q)
+            )
+        else:
+            qs = base_qs
+
+        paginator = ListingPagination()
+        page = paginator.paginate_queryset(qs, self.request, view=self)
+        serializer = CompactListingSerializer(page, many=True)
+        return paginator.get_paginated_response(serializer.data)
 
     def perform_destroy(self, instance):
         """Delete listing and associated S3 images"""
@@ -149,3 +323,154 @@ class ListingViewSet(
 
         # Delete the listing (will cascade delete ListingImage records)
         instance.delete()
+
+    @action(detail=False, methods=["get"], url_path="filter-options")
+    def filter_options(self, request):
+        """
+        Get filter options (categories and dorm locations) from active listings
+        merged with defaults. Returns a union of available options from the
+        database and default options, ensuring users always see a complete set
+        of filter choices.
+
+        Note: The original MVP implementation returned only options that exist
+        in active listings, which made the filter options seem very limited when
+        the database had few listings. This endpoint now returns available | defaults
+        to provide a better user experience.
+
+        Endpoint: GET /api/v1/listings/filter-options/
+        Response: {
+            "categories": [...],  # Sorted list of available + default categories
+            "dorm_locations": {  # Grouped by area (new format)
+                "washington_square": [...],
+                "downtown": [...],
+                "other": [...]
+            },
+            "locations": [...]  # Flat list for backward compatibility
+        }
+
+        Note: Currently, "locations" contains dorm locations only. In the future,
+        "location" may be used for non-dorm geographic locations
+        (e.g., via Google Maps API).
+        """
+        # Get distinct categories from active listings (non-empty, sorted)
+        available_categories = set(
+            Listing.objects.filter(status="active")
+            .exclude(Q(category__isnull=True) | Q(category=""))
+            .values_list("category", flat=True)
+            .distinct()
+        )
+
+        # Merge with defaults and sort
+        all_categories = sorted(set(DEFAULT_CATEGORIES) | available_categories)
+
+        # Get distinct dorm locations from active listings
+        # (non-empty, non-null, sorted)
+        available_locations = set(
+            Listing.objects.filter(status="active")
+            .exclude(Q(dorm_location__isnull=True) | Q(dorm_location=""))
+            .values_list("dorm_location", flat=True)
+            .distinct()
+        )
+
+        # Merge with defaults
+        all_dorm_locations = set(DEFAULT_DORM_LOCATIONS_FLAT) | available_locations
+
+        # Group dorm locations by area
+        # Include defaults and any matching locations from DB
+        grouped_dorm_locations = {
+            "washington_square": sorted(
+                set(WASHINGTON_SQUARE_DORMS)
+                | (all_dorm_locations & set(WASHINGTON_SQUARE_DORMS))
+            ),
+            "downtown": sorted(
+                set(DOWNTOWN_DORMS) | (all_dorm_locations & set(DOWNTOWN_DORMS))
+            ),
+            "other": sorted(
+                set(OTHER)
+                | (
+                    all_dorm_locations
+                    - set(WASHINGTON_SQUARE_DORMS)
+                    - set(DOWNTOWN_DORMS)
+                )
+            ),
+        }
+
+        # Flat list for backward compatibility (sorted)
+        flat_locations = sorted(all_dorm_locations)
+
+        return Response(
+            {
+                "categories": all_categories,
+                "dorm_locations": grouped_dorm_locations,
+                "locations": flat_locations,  # Backward compatibility
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=True,
+        methods=["post"],
+        permission_classes=[IsAuthenticated],
+        url_path="contact-seller",
+    )
+    def contact_seller(self, request, pk=None):
+        """
+        Start or fetch a direct chat between request.user and this listing's owner.
+        POST /api/v1/listings/{id}/contact-seller/
+        """
+        listing = self.get_object()
+        if listing.user_id == request.user.id:
+            return Response(
+                {"detail": "You are the owner of this listing."}, status=400
+            )
+
+        dk = Conversation.make_direct_key(request.user.id, listing.user_id)
+        with transaction.atomic():
+            conv, _ = Conversation.objects.select_for_update().get_or_create(
+                direct_key=dk, defaults={"created_by": request.user}
+            )
+            have = set(
+                ConversationParticipant.objects.filter(conversation=conv).values_list(
+                    "user_id", flat=True
+                )
+            )
+            need = {request.user.id, listing.user_id} - have
+            for uid in need:
+                ConversationParticipant.objects.get_or_create(
+                    conversation=conv, user_id=uid
+                )
+
+        return Response({"conversation_id": str(conv.id)}, status=200)
+
+    # Record listing view-count
+    def retrieve(self, request, *args, **kwargs):
+        response = super().retrieve(request, *args, **kwargs)
+        try:
+            should_track = request.headers.get(
+                "X-Track-View"
+            ) == "1" or request.query_params.get("track_view") in {"1", "true", "yes"}
+            if not should_track:
+                return response
+
+            obj = self.get_object()
+            cache_key = self._viewer_cache_key(request, obj.pk)  # obj.pk: listing_id
+            if not cache.get(cache_key):
+                Listing.objects.filter(pk=obj.pk).update(view_count=F("view_count") + 1)
+                cache.set(
+                    cache_key, 1, timeout=300
+                )  # Same visit won't be counted in 5 minutes
+        except Exception:
+            pass
+        return response
+
+    def _viewer_cache_key(self, request, listing_id):
+        if request.user.is_authenticated:
+            ident = f"user:{request.user.id}"
+        else:
+            ip = (request.META.get("HTTP_X_FORWARDED_FOR") or "").split(",")[
+                0
+            ].strip() or request.META.get("REMOTE_ADDR", "")
+            ua = (request.META.get("HTTP_USER_AGENT") or "")[:64]
+            ident = f"ip:{ip}|ua:{ua}"
+
+        return f"listing:view:{listing_id}:{ident}"

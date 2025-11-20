@@ -17,18 +17,22 @@ db.sqlite3
 db.sqlite3-journal
 /media/
 /staticfiles/
+staticfiles/
 
 # Virtual Environments
 .env
-.venv
+.venv*
 env/
 venv/
 ENV/
+eb-virt/
 
 # Test & Coverage Artifacts
 .coverage
 .coverage.*
 coverage/
+coverage*.txt
+test-output.txt
 .pytest_cache/
 htmlcov/
 
@@ -36,6 +40,7 @@ htmlcov/
 node_modules/
 dist/
 build/
+frontend_build/
 .npm/
 npm-debug.log*
 yarn-debug.log*

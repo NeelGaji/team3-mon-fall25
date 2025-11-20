@@ -15,11 +15,52 @@ Including another URLconf
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
 
+import os
+
+from django.conf import settings
 from django.contrib import admin
-from django.urls import path, include
+from django.http import HttpResponse
+from django.urls import include, path, re_path
+from django.views.decorators.csrf import csrf_exempt
+
+# # SPA index.html（No CSRF). To avoid CSRF middleware's intercept
+# spa_view = method_decorator(csrf_exempt, name="dispatch")(
+#     TemplateView.as_view(template_name="index.html")
+# )
+
+
+@csrf_exempt
+def spa_view(request):
+    index_path = os.path.join(settings.STATIC_ROOT, "index.html")
+    try:
+        with open(index_path, "r", encoding="utf-8") as f:
+            html = f.read()
+    except FileNotFoundError:
+        return HttpResponse(
+            "index.html not found on server (did postdeploy run?)",
+            status=500,
+            content_type="text/plain",
+        )
+    return HttpResponse(html, content_type="text/html")
+
 
 urlpatterns = [
-    path('api/v1/', include('apps.users.urls')),
-    path('api/v1/', include('apps.listings.urls')),
+    path("api/v1/", include("apps.chat.urls")),
+    path("api/v1/", include("apps.users.urls")),
+    path("api/v1/", include("apps.profiles.urls")),
+    path("api/v1/", include("apps.listings.urls")),
     path("admin/", admin.site.urls),
+    path("", include("apps.common.urls")),  # Health check and other common endpoints
 ]
+
+# SPA fallback, excluding api/admin/static/media
+urlpatterns += [
+    re_path(r"^(?!api/|admin/|static/|media/).*$", spa_view),
+]
+
+# DEBUG only, Django serves static files
+# If DEBUG=Flase, Nginx serves /static/ instead of Django
+if settings.DEBUG:
+    from django.conf.urls.static import static
+
+    urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)

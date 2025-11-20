@@ -1,7 +1,6 @@
-from django.db import models
-
 # Create your models here.
 from django.core.validators import MinValueValidator
+from django.db import models
 
 
 class Listing(models.Model):
@@ -22,9 +21,10 @@ class Listing(models.Model):
         max_digits=10, decimal_places=2, validators=[MinValueValidator(0)]
     )
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="active")
-    location = models.CharField(max_length=100, blank=True, null=True)
+    dorm_location = models.CharField(max_length=100, blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    view_count = models.PositiveIntegerField(default=0)
 
     class Meta:
         db_table = "listings"
@@ -48,9 +48,9 @@ class ListingImage(models.Model):
     display_order = models.IntegerField(
         default=0
     )  # if there are multiple image order helps in ordering the images.
-    is_primary = models.BooleanField(
-        default=False
-    )  # first image to show when the user opens the listing. This need not always be the first image.
+    is_primary = models.BooleanField(default=False)
+    # First image to show when the user opens the listing.
+    # This need not always be the first image.
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -63,3 +63,32 @@ class ListingImage(models.Model):
 
     def __str__(self):
         return f"Image for {self.listing.title}"
+
+
+class Watchlist(models.Model):
+    """Model to track listings saved by users"""
+
+    watchlist_id = models.AutoField(primary_key=True)
+    user = models.ForeignKey(
+        "users.User",
+        on_delete=models.CASCADE,
+        related_name="watchlist_items",
+    )
+    listing = models.ForeignKey(
+        Listing,
+        on_delete=models.CASCADE,
+        related_name="watchlist_entries",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "watchlist"
+        unique_together = [["user", "listing"]]
+        indexes = [
+            models.Index(fields=["user"]),
+            models.Index(fields=["listing"]),
+        ]
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.user.email} - {self.listing.title}"
